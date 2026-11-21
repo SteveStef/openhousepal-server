@@ -149,6 +149,22 @@ async def require_admin_user(current_user=Depends(get_current_active_user)):
     return current_user
 
 
+# A trial that just ended stays open this long while PayPal takes the first payment (its "payment done" notice
+# often comes hours after the trial's last minute). Only with a real PayPal subscription; a failed card still locks
+# as soon as PayPal says so (SUSPENDED).
+TRIAL_PAYMENT_GRACE = timedelta(hours=48)
+
+
+def trial_still_open(user, now=None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    ends = getattr(user, "trial_ends_at", None)
+    if not ends:
+        return False
+    if ends > now:
+        return True
+    return bool(getattr(user, "subscription_id", None)) and ends + TRIAL_PAYMENT_GRACE > now
+
+
 def _assert_active_subscription(current_user) -> None:
     """Tier-agnostic status check: any of the 4 plan tiers passes as long as the subscription
     itself is ACTIVE, in a valid TRIAL, or CANCELLED-but-still-in-its-paid grace period.
@@ -159,7 +175,7 @@ def _assert_active_subscription(current_user) -> None:
         return
 
     if current_user.subscription_status == "TRIAL":
-        if current_user.trial_ends_at and current_user.trial_ends_at > now:
+        if trial_still_open(current_user, now):
             return
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -277,7 +293,7 @@ def subscription_is_active(user) -> bool:
     if status_value == "ACTIVE":
         return True
     if status_value == "TRIAL":
-        return bool(user.trial_ends_at and user.trial_ends_at > now)
+        return trial_still_open(user, now)
     if status_value == "CANCELLED":
         if user.trial_ends_at and user.trial_ends_at > now:
             return True

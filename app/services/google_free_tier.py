@@ -221,6 +221,21 @@ def install() -> None:
     _installed = True
 
 
+async def share_used(sku: str) -> float:
+    """How much of this month's free calls of one kind are used (0-1+) - lets a feature step down to a cheaper
+    kind of call before the free amount runs out (town pages' rated search, owner 11/20)."""
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
+    from app.models.database import UsageBudgetCounter
+    from app.services.usage_budget_service import _period_keys
+    _day, month = _period_keys()
+    async with AsyncSessionLocal() as db:
+        used = (await db.execute(select(UsageBudgetCounter.count).where(
+            UsageBudgetCounter.bucket == f"google_free:{sku}", UsageBudgetCounter.period_type == "month",
+            UsageBudgetCounter.period_key == month))).scalar() or 0
+    return (used + _used_before(sku, month)) / max(1, FREE_PER_MONTH[_tier_of(sku)])
+
+
 async def month_usage(db) -> list[dict]:
     """This month's count per kind of Google call against its free allowance - for the admin page."""
     from sqlalchemy import select

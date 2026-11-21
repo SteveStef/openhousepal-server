@@ -515,7 +515,9 @@ async def cancel_broadcast(
     try:
         await service.cancel_broadcast(db, current_user, broadcast_id)
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        # not found = 404; a slot a teammate already took = 409 (the message says what happened)
+        code = status.HTTP_404_NOT_FOUND if str(e) == "Broadcast not found." else status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=code, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to cancel broadcast: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Unable to cancel this broadcast right now.")

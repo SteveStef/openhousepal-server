@@ -44,10 +44,10 @@ def visitor_device_id(request: Request, response: Response) -> str:
 
 async def explore_nearby_response(
     db: AsyncSession, lat: float, lng: float, category: str,
-    ip: Optional[str], device_id: str, owner_id: Optional[str],
+    ip: Optional[str], device_id: str, owner_id: Optional[str], town: Optional[dict] = None,
 ):
     try:
-        return await get_explore_nearby(db, lat, lng, category, ip=ip, device_id=device_id, owner_id=owner_id)
+        return await get_explore_nearby(db, lat, lng, category, ip=ip, device_id=device_id, owner_id=owner_id, town=town)
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

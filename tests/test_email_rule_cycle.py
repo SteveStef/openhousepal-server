@@ -72,7 +72,8 @@ async def _setup():
 
 async def _sent(s, days_ago: float, template: str = "showcase_daily_digest") -> str:
     async with AsyncSessionLocal() as db:
-        at = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        # Midday (17:00 UTC = noon/1 PM Eastern): near midnight, and around the clock change, two "days ago" can be one Eastern day.
+        at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).replace(hour=17, minute=0)
         rec = ClientEmail(owner_id=s["agent"], recipient_email=s["client"], template=template, subject="x",
                           kind="auto" if template in ce.AUTO_TEMPLATES else "personal", status="sent", sent_at=at, created_at=at)
         db.add(rec)

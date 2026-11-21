@@ -1044,7 +1044,10 @@ async def get_site_area_nearby(
     if not origin:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="This community does not have a usable map center.")
     device_id = _visitor_device_id(request, response)
-    return await _explore_nearby_response(db, origin[0], origin[1], category, _client_ip(request), device_id, user.id)
+    # the town's own outline (the top map's) - places inside it only (owner 11/20)
+    outline = ((area.facts or {}).get("boundaries") or {}).get("outline") or {}
+    town = {"key": area.id, "rings": outline["rings"], "name": f"{area.name}, {area.state}" if area.state else area.name} if outline.get("rings") else None
+    return await _explore_nearby_response(db, origin[0], origin[1], category, _client_ip(request), device_id, user.id, town=town)
 
 
 @router.get("/{site_id}/areas/{slug}/listings")

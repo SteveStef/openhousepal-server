@@ -11875,7 +11875,7 @@ def _income_property_sentence(subject: Optional[dict]) -> Optional[str]:
         n = None
     what = {2: "a two-unit", 3: "a three-unit", 4: "a four-unit"}.get(n, "a multi-unit")
     return (f"This is {what} income property. Its value here comes from the sales of similar buildings alone - rents and "
-            "expenses are not in the MLS and were not analysed - so read the range as the answer and weigh it against "
+            "expenses are not in the MLS and were not analyzed - so read the range as the answer and weigh it against "
             "the building's actual income.")
 
 

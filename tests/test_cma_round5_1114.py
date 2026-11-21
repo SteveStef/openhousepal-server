@@ -492,7 +492,7 @@ def test_a_duplex_is_always_limited_and_says_there_is_no_rent_data():
     e = ai._evidence_strength(subject, t, 378000, comps)
     assert e["level"] == "limited" and e["multi_family"] and "no rent or expense data" in e["message"]
     s = ai._income_property_sentence(subject)
-    assert s.startswith("This is a two-unit income property.") and "rents and expenses are not in the MLS and were not analysed" in s
+    assert s.startswith("This is a two-unit income property.") and "rents and expenses are not in the MLS and were not analyzed" in s
     assert ai._income_property_sentence({"property_type": "SINGLE_FAMILY"}) is None
     assert ai._income_property_sentence({"property_type": "MULTI_FAMILY"}).startswith("This is a multi-unit income property.")
 

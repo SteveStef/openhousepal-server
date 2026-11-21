@@ -3,7 +3,7 @@ import io
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, get_args
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -17,7 +17,7 @@ from app.models.database import AgentTask, Collection, Lead, LeadEvent, LeadNote
 from app.services import mls_mirror
 from app.schemas.leads import (
     LeadAlertsOut, LeadAlertsUpdate, LeadDetailOut, LeadEventOut, LeadHandleRequest, LeadHideRequest, LeadMomentOut, LeadNoteCreate, LeadNoteOut, LeadNoteUpdate,
-    LeadOpenHouseOut, LeadOut, LeadPropertyOut, LeadShowcaseOut, LeadSort, LeadSourceFilter, LeadStatus, LeadRepresented,
+    LeadOpenHouseOut, LeadOut, LeadPropertyOut, LeadShowcaseOut, LeadSort, LeadSourceFilter, LeadSourceType, LeadStatus, LeadRepresented,
     LeadTodoOut, LeadUpdate,
 )
 from app.services.leads_service import QUIET_ACTIVITY_TYPES, normalize_email, normalize_phone
@@ -354,7 +354,7 @@ def _to_lead_out(lead: Lead, collections: Optional[List[Collection]] = None) -> 
         primary_source=primary_source,
         source_count=len({e.source_type for e in events}),
         last_event_summary=_nice_summary(last_event) if last_event else None,
-        last_event_source_type=last_event.source_type if last_event else None,
+        last_event_source_type=last_event.source_type if last_event and last_event.source_type in KNOWN_EVENT_TYPES else None,
         last_event_at=_last_activity_at(lead, events, matched_collections),
         last_event_occurred_at=last_event.occurred_at if last_event else None,
         # The home they reached out about - not one they just liked or looked at in their Showcase.
@@ -979,6 +979,10 @@ _SHOWCASE_ORIGIN = {
 }
 
 
+# Every activity kind the Leads screens can show (schemas/leads.py LeadSourceType).
+KNOWN_EVENT_TYPES = frozenset(get_args(LeadSourceType))
+
+
 async def _events_out(db: AsyncSession, owner_id: str, events: List[LeadEvent]) -> List[LeadEventOut]:
     # Open house sign-ins: is the guest represented, and was it the agent's own listing (user, 10/29 -
     # a represented guest at someone else's listing isn't worth a suggested follow-up).
@@ -998,6 +1002,10 @@ async def _events_out(db: AsyncSession, owner_id: str, events: List[LeadEvent]) 
             logger.warning("own-listing check failed for lead events", exc_info=True)
     out = []
     for e in events:
+        if e.source_type not in KNOWN_EVENT_TYPES:
+            # a kind this screen doesn't know yet - skip the line, never fail the whole lead (Day 20)
+            logger.warning("lead event of unknown kind skipped", extra={"source_type": e.source_type, "event_id": e.id})
+            continue
         item = LeadEventOut.model_validate(e)
         item.summary = _nice_summary(e)
         item.handled = e.agent_viewed_at is not None

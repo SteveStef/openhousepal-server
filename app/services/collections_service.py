@@ -288,6 +288,12 @@ async def engaged_home_ids(db: AsyncSession, collection_id: str, keep_viewed: bo
     return {r[0] for r in (await db.execute(keep_query)).all()}
 
 
+
+def _masked_email(e: str) -> str:
+    """"d***@gmail.com" - enough for the client to recognise their own, never the address itself."""
+    local, _, domain = (e or "").partition("@")
+    return f"{local[:1]}***@{domain}" if local and domain else "anonymous@visitor.com"
+
 class CollectionsService:
 
     @staticmethod
@@ -1939,8 +1945,10 @@ class CollectionsService:
                 'customer': {
                     'firstName': collection.visitor_name.split(' ')[0] if collection.visitor_name else 'Anonymous',
                     'lastName': collection.visitor_name.split(' ')[-1] if collection.visitor_name and ' ' in collection.visitor_name else 'Visitor',
-                    'email': collection.visitor_email or 'anonymous@visitor.com',
-                    'phone': collection.visitor_phone or 'N/A',
+                    # Anyone holding the link reads this (Day 19 audit 11/20: it carried the client's real email and
+                    # phone) - the page only needs to know whether it's an anonymous visitor's.
+                    'email': _masked_email(collection.visitor_email) if collection.visitor_email else 'anonymous@visitor.com',
+                    'phone': 'N/A',
                     'preferredContact': 'EMAIL',
                     'is_blacklisted': is_blacklisted
                 },

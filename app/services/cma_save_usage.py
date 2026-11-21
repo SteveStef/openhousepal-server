@@ -75,13 +75,13 @@ def render_email(template: str, subject: str, v: dict) -> tuple[str, str, str]:
     else:
         used = v.get("used_line") or ""
         body = [eyebrow("CMA"), h1("Your CMA is ready"),
-                para(f"Hi {e(v.get('first_name') or 'there')}, the CMA for {e(home)} is finished - comps analysed, value worked out and the report written."),
+                para(f"Hi {e(v.get('first_name') or 'there')}, the CMA for {e(home)} is finished - comps analyzed, value worked out and the report written."),
                 para("Nothing is sent to your client until you share it. Give it a read first.")]
         if used:
             body.append(para(e(used), muted=True))
         body.append(button("Open the CMA", link))
         text = [f"Your CMA for {home} is ready.", "Nothing is sent to your client until you share it.", used, f"Open it: {link}"]
-        pre = "Comps analysed, value worked out and the report written."
+        pre = "Comps analyzed, value worked out and the report written."
     html = shell(title=subject, preheader=pre, header_cells=ohp_header("CMA"), body="".join(body), footer=_settings_footer(v.get("app_url") or ""))
     return subject, html, "\n".join(t for t in text if t)
 

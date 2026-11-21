@@ -2865,6 +2865,12 @@ async def cancel_broadcast(db: AsyncSession, current_user: User, broadcast_id: s
     broadcast = result.scalar_one_or_none()
     if not broadcast:
         raise ValueError("Broadcast not found.")
+    if broadcast.status == "filled":
+        # A teammate took it while the agent's window was still open: cancelling here would leave them hosting
+        # without knowing it was called off. The host request is changed from Manage hosts instead.
+        raise ValueError("A teammate just took this slot, so it can't be cancelled here. Open Manage hosts to see who is hosting.")
+    if broadcast.status == "cancelled":
+        return
     was_open = broadcast.status == "open"
     broadcast.status = "cancelled"
     if was_open:

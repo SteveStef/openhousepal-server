@@ -111,6 +111,13 @@ EXPLORE_NEARBY_FIELD_MASK = (
     "places.shortFormattedAddress,places.location,places.businessStatus"  # Pro field like the rest - same price
 )
 EXPLORE_NEARBY_DETAILS_FIELD_MASK = "id,rating,userRatingCount"
+# A town page's rated search (owner 11/20): the same search plus these - Enterprise fields, so Google counts it as
+# Nearby Search Enterprise (1,000 free a month). RATED_SWITCH_AT = the share of that free 1,000 after which the
+# plain search takes over for the rest of the month.
+EXPLORE_NEARBY_RATED_FIELD_MASK = EXPLORE_NEARBY_FIELD_MASK + ",places.rating,places.userRatingCount,places.priceLevel,places.regularOpeningHours.periods"
+RATED_SWITCH_AT = 0.80
+_PRICE_LEVELS = {"PRICE_LEVEL_FREE": 0, "PRICE_LEVEL_INEXPENSIVE": 1, "PRICE_LEVEL_MODERATE": 2, "PRICE_LEVEL_EXPENSIVE": 3,
+                 "PRICE_LEVEL_VERY_EXPENSIVE": 4}
 ROUTES_FIELD_MASK = "originIndex,destinationIndex,duration,distanceMeters,condition"
 # Google's includedTypes filter on Nearby Search (New) is a soft ranking bias, not a hard filter - a
 # request scoped to includedTypes=["supermarket","grocery_store"] still comes back with gas stations,
@@ -121,6 +128,8 @@ ROUTES_FIELD_MASK = "originIndex,destinationIndex,duration,distanceMeters,condit
 # EXPLORE_NEARBY_DISPLAY_LIMIT then caps what's actually shown to a clean, non-overwhelming list.
 EXPLORE_NEARBY_MAX_RESULTS = 20
 EXPLORE_NEARBY_DISPLAY_LIMIT = 6
+# A town page lists every place inside the town the one search found (owner 11/20: "show 10 but have a show more").
+TOWN_PLACES_LIMIT = EXPLORE_NEARBY_MAX_RESULTS
 EXPLORE_NEARBY_DEFAULT_RADIUS_MILES = 2.5
 EXPLORE_NEARBY_SEARCH_ESTIMATED_COST_USD = 0.032
 EXPLORE_NEARBY_DETAILS_ESTIMATED_COST_USD = 0.025  # Enterprise + Atmosphere SKU (rating/review fields), not Pro
@@ -1325,7 +1334,7 @@ async def _write_explore_cache(db: AsyncSession, cache_key: str, payload: dict) 
     await db.commit()
 
 
-def _explore_place_to_response(place: dict, category: str, origin_lat: float, origin_lng: float) -> Optional[ExploreNearbyPlace]:
+def _explore_place_to_response(place: dict, category: str, origin_lat: float, origin_lng: float, rated: bool = False) -> Optional[ExploreNearbyPlace]:
     name = _place_name(place)
     location = place.get("location") or {}
     lat, lng = location.get("latitude"), location.get("longitude")
@@ -1338,6 +1347,11 @@ def _explore_place_to_response(place: dict, category: str, origin_lat: float, or
         name=name,
         category=((place.get("primaryTypeDisplayName") or {}).get("text") or category).strip() or category,
         address=place.get("shortFormattedAddress"),
+        # only on the rated search - the plain one never shows a rating (its card looks it up on tap)
+        rating=place.get("rating") if rated else None,
+        review_count=place.get("userRatingCount") if rated else None,
+        price_level=_PRICE_LEVELS.get(place.get("priceLevel") or "") if rated else None,
+        hours=((place.get("regularOpeningHours") or {}).get("periods") or None) if rated else None,
         distance_miles=round(distance, 1),
         latitude=float(lat),
         longitude=float(lng),
@@ -1494,6 +1508,8 @@ async def _fetch_explore_nearby_live(
     lng: float,
     category_key: str,
     radius_miles: float,
+    cut: bool = True,
+    rated: bool = False,
 ) -> ExploreNearbyResponse:
     category = EXPLORE_NEARBY_CATEGORIES[category_key]
     started = time.perf_counter()
@@ -1514,7 +1530,7 @@ async def _fetch_explore_nearby_live(
             headers={
                 "Content-Type": "application/json",
                 "X-Goog-Api-Key": api_key,
-                "X-Goog-FieldMask": EXPLORE_NEARBY_FIELD_MASK,
+                "X-Goog-FieldMask": EXPLORE_NEARBY_RATED_FIELD_MASK if rated else EXPLORE_NEARBY_FIELD_MASK,
             },
             timeout=10.0,
         )
@@ -1522,7 +1538,7 @@ async def _fetch_explore_nearby_live(
     raw_places = [raw for raw in response.json().get("places", []) if _explore_place_is_relevant(raw, category_key)]
     places = []
     for raw in raw_places:
-        p = _explore_place_to_response(raw, category["label"], lat, lng)
+        p = _explore_place_to_response(raw, category["label"], lat, lng, rated=rated)
         if p is None:
             continue
         # Plain labels a buyer reads at a glance (not Google's own "Secondary school").
@@ -1536,7 +1552,8 @@ async def _fetch_explore_nearby_live(
             continue
         places.append(p)
     places.sort(key=lambda p: p.distance_miles if p.distance_miles is not None else float("inf"))
-    places = places[:EXPLORE_NEARBY_DISPLAY_LIMIT]
+    if cut:
+        places = places[:EXPLORE_NEARBY_DISPLAY_LIMIT]
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     logger.info(
         "Google Places Explore Nearby request",
@@ -1569,8 +1586,14 @@ async def get_explore_nearby(
     ip: Optional[str] = None,
     device_id: Optional[str] = None,
     owner_id: Optional[str] = None,
+    town: Optional[dict] = None,
 ) -> ExploreNearbyResponse:
     """Interactive public-site Places lookup.
+
+    town = {"key": <the area's id>, "rings": <its saved outline>} on an IDX town page (owner 11/20: "show the town
+    on the map, not district, not the school ... then show restaurants in there"): the search covers the whole
+    outline and only places inside it are shown, nearest the town center (lat/lng) first. Set by the server from
+    the area record, never by the visitor - so it can't be used to force fresh (billed) searches.
 
     Backed by a persistent cache (ExploreNearbyCache, TTL config-driven - see
     places_explore_cache_ttl_days) keyed at a coarse lat/lng grid (EXPLORE_NEARBY_CACHE_GEO_PRECISION)
@@ -1593,6 +1616,8 @@ async def get_explore_nearby(
     # legitimate ever set a custom radius (the frontend never sent one), so this closes that off
     # entirely rather than just capping the damage.
     safe_radius = EXPLORE_NEARBY_CATEGORIES[normalized_category].get("radius_miles") or EXPLORE_NEARBY_DEFAULT_RADIUS_MILES
+    if town and town.get("rings") and town.get("key"):
+        return await _town_explore_nearby(db, float(lat), float(lng), normalized_category, town, ip=ip, device_id=device_id, owner_id=owner_id)
     grid_key = (
         f"{round(float(lat), EXPLORE_NEARBY_CACHE_GEO_PRECISION)}:{round(float(lng), EXPLORE_NEARBY_CACHE_GEO_PRECISION)}:"
         f"{normalized_category}:{round(safe_radius, 2)}"
@@ -1644,6 +1669,154 @@ async def get_explore_nearby(
             async with _explore_nearby_lock:
                 if _explore_nearby_inflight.get(grid_key) is task:
                     _explore_nearby_inflight.pop(grid_key, None)
+
+
+def _open_now(periods: Optional[list], now=None) -> Optional[bool]:
+    """Open at this moment, from Google's weekly periods (day 0 = Sunday), on Eastern time. None = hours unknown."""
+    if not periods:
+        return None
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = now or datetime.now(ZoneInfo("America/New_York"))
+    week = 7 * 1440
+    t = ((now.weekday() + 1) % 7) * 1440 + now.hour * 60 + now.minute
+    for p in periods:
+        o, c = p.get("open") or {}, p.get("close")
+        if not c:
+            return True   # open around the clock
+        start = o.get("day", 0) * 1440 + o.get("hour", 0) * 60 + o.get("minute", 0)
+        end = c.get("day", 0) * 1440 + c.get("hour", 0) * 60 + c.get("minute", 0)
+        if end <= start:
+            end += week
+        if start <= t < end or start <= t + week < end:
+            return True
+    return False
+
+
+# What a town page asks Google for each category ("restaurants in Wayne, PA") and the type it leans on.
+_TOWN_WORDS = {"restaurants": ("restaurants", "restaurant"), "coffee": ("coffee shops", "cafe"), "grocery": ("grocery stores", "grocery_store"),
+               "schools": ("schools", "school"), "parks": ("parks", "park"), "shopping": ("shopping", None), "medical": ("hospitals", "hospital")}
+
+
+async def _fetch_town_text_live(api_key: str, rings: list, place: str, category_key: str, rated: bool,
+                                lat: float, lng: float) -> ExploreNearbyResponse:
+    """One Text Search for the whole town, kept to its box (every place returned is in that box; the outline check after
+    trims the corners)."""
+    from app.services.areas.boundary_service import bbox
+    x0, y0, x1, y1 = bbox(rings)
+    words, kind = _TOWN_WORDS.get(category_key, (category_key, None))
+    body = {"textQuery": f"{words} in {place}", "pageSize": EXPLORE_NEARBY_MAX_RESULTS,
+            "locationRestriction": {"rectangle": {"low": {"latitude": y0, "longitude": x0}, "high": {"latitude": y1, "longitude": x1}}}}
+    if kind:
+        body["includedType"] = kind
+    started = time.perf_counter()
+    async with httpx.AsyncClient() as client:
+        response = await client.post(PLACES_TEXT_URL, json=body, headers={
+            "Content-Type": "application/json", "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": EXPLORE_NEARBY_RATED_FIELD_MASK if rated else EXPLORE_NEARBY_FIELD_MASK}, timeout=10.0)
+        response.raise_for_status()
+    category = EXPLORE_NEARBY_CATEGORIES[category_key]
+    places = []
+    for raw in response.json().get("places", []):
+        if not _explore_place_is_relevant(raw, category_key):
+            continue
+        p = _explore_place_to_response(raw, category["label"], lat, lng, rated=rated)
+        if p is None or any(q.name.strip().lower() == p.name.strip().lower()
+                            and _haversine_miles(q.latitude, q.longitude, p.latitude, p.longitude) < 0.25 for q in places):
+            continue
+        places.append(p)
+    logger.info("Google Places town search", extra={"feature": "explore_nearby_search", "category": category_key, "town": place,
+                                                    "rated": rated, "result_count": len(places), "cache_hit": False,
+                                                    "elapsed_ms": round((time.perf_counter() - started) * 1000)})
+    return ExploreNearbyResponse(category=category_key, origin={"lat": lat, "lng": lng}, radius_miles=0.0, places=places,
+                                 cache_hit=False, sku="text_search_enterprise" if rated else "text_search_pro")
+
+
+def _rated_score(p: dict) -> float:
+    """Stars pulled toward 4.0 until a place has plenty of reviews; no rating = last."""
+    r, n = p.get("rating"), p.get("review_count") or 0
+    if r is None:
+        return 0.0
+    return (float(r) * n + 4.0 * 25) / (n + 25)
+
+
+def _town_reach(rings: list, lat: float, lng: float, default: float) -> float:
+    """How far the search reaches from the town center: the category's usual circle, smaller for a small town
+    (never past its farthest outline point). A circle around the whole outline brought back the most popular places
+    of the next towns over (King of Prussia for Wayne) - only one of them was inside Wayne."""
+    pts = [(float(p[1]), float(p[0])) for r in rings for p in r if isinstance(p, (list, tuple)) and len(p) >= 2]
+    far = max(_haversine_miles(lat, lng, a, b) for a, b in pts) if pts else default
+    return round(max(0.75, min(default, far + 0.1)), 2)
+
+
+async def _town_explore_nearby(
+    db: AsyncSession, lat: float, lng: float, category: str, town: dict,
+    ip: Optional[str] = None, device_id: Optional[str] = None, owner_id: Optional[str] = None,
+) -> ExploreNearbyResponse:
+    """One search across the town's whole outline (cached per town + category, like every search), then only the
+    places inside the outline, nearest the town center first, up to the usual display limit."""
+    from app.services.areas.boundary_service import contains, bbox
+    rings = town["rings"]
+    place = town.get("name") or "the town"
+    radius = 0.0
+    base_key = f"town:{town['key']}:{category}:text"
+    config = await ai_config_service.get_config(db)
+    ttl = config["places_explore_cache_ttl_days"]
+    # a saved rated search is always used first (free); a new one is rated only while the free 1,000 has room
+    payload = await _read_explore_cache(db, f"search:v{EXPLORE_NEARBY_CACHE_VERSION}:{base_key}:rated", ttl)
+    rated = payload is not None
+    if payload is None:
+        from app.services import google_free_tier
+        try:
+            rated = (await google_free_tier.share_used("text_search_enterprise")) < RATED_SWITCH_AT
+        except Exception:  # noqa: BLE001 - no reading, no risk: the plain search
+            rated = False
+        if not rated:
+            payload = await _read_explore_cache(db, f"search:v{EXPLORE_NEARBY_CACHE_VERSION}:{base_key}", ttl)
+    grid_key = base_key + (":rated" if rated else "")
+    cache_key = f"search:v{EXPLORE_NEARBY_CACHE_VERSION}:{grid_key}"
+    hit = payload is not None
+    if payload is None:
+        api_key = os.getenv("GOOGLE_PLACES_API_KEY")
+        if not api_key:
+            raise ExploreNearbyLookupUnavailable("GOOGLE_PLACES_API_KEY is not configured.")
+        owner = False
+        async with _explore_nearby_lock:
+            task = _explore_nearby_inflight.get(grid_key)
+            if task is None:
+                await _check_and_reserve_explore_budget_locked(db, "explore_nearby_search", config, ip=ip, device_id=device_id, owner_id=owner_id)
+                task = asyncio.create_task(_fetch_town_text_live(api_key, rings, place, category, rated, lat, lng))
+                _explore_nearby_inflight[grid_key] = task
+                owner = True
+        try:
+            try:
+                result = await task
+            except httpx.RequestError:
+                if not rated:
+                    raise
+                # Google refused the rated search (its free calls are used up) - the plain one, same places
+                rated, cache_key = False, f"search:v{EXPLORE_NEARBY_CACHE_VERSION}:{base_key}"
+                result = await _fetch_town_text_live(api_key, rings, place, category, False, lat, lng)
+            payload = result.model_dump(mode="json")
+            if owner:
+                await _write_explore_cache(db, cache_key, payload)
+        finally:
+            if owner:
+                async with _explore_nearby_lock:
+                    if _explore_nearby_inflight.get(grid_key) is task:
+                        _explore_nearby_inflight.pop(grid_key, None)
+    box = bbox(rings)
+    inside = [p for p in payload.get("places", [])
+              if p.get("latitude") is not None and p.get("longitude") is not None
+              and contains(rings, float(p["longitude"]), float(p["latitude"]), box)]
+    served = _rehydrate_places_for_origin({**payload, "places": inside}, lat, lng)
+    if rated:   # best rated first: stars weighed by how many reviews (a 4.8 from 900 beats a 5.0 from 3)
+        served["places"].sort(key=lambda p: (-_rated_score(p), p.get("distance_miles") or 0))
+    for p in served["places"]:   # open right now - worked out this minute, never from when it was saved
+        p["open_now"] = _open_now(p.pop("hours", None))
+    served["places"] = served["places"][:TOWN_PLACES_LIMIT]   # the page shows 10, then 'Show more' (owner 11/20)
+    served["radius_miles"] = radius
+    return ExploreNearbyResponse(**{**served, "cache_hit": hit})
 
 
 def _normalize_place_id(place_id: str) -> str:

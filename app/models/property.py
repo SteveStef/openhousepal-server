@@ -272,6 +272,11 @@ class ExploreNearbyPlace(BaseModel):
     address: Optional[str] = None
     rating: Optional[float] = None
     review_count: Optional[int] = None
+    # 1-4 ($ to $$$$) and open right now - only on a town page's rated search (owner 11/20)
+    price_level: Optional[int] = None
+    open_now: Optional[bool] = None
+    # the weekly opening hours behind open_now (kept with the saved search, worked out per visit, never sent)
+    hours: Optional[List[Dict[str, Any]]] = None
     distance_miles: Optional[float] = None
     latitude: float
     longitude: float
