@@ -1556,7 +1556,15 @@ def summarize_history(events: list, *, current_list_date=None, today=None, curre
                      + f": {cur_days} days on this listing, about {chain_days + (cur_days or 0)} days on the market in total "
                        "since the earlier listing began")
     last_sale = prior_sales[-1] if prior_sales else None
+    # Listings that began AFTER the record the report is about (11/20, 101 Watkins Pond Blvd #4-103: the agent picked
+    # the Mar 2025 sale; the home was listed again May 28, 2026, cut to $410,000 and taken off the market unsold -
+    # and the report never knew). Only kept when the record is not the home's newest one.
+    later = [p for p in periods if p is not current and p.get("start") and cur and p["start"] > cur]
     return {
+        "later_listings": [{"listed": p["start"].isoformat(), "list_price": p.get("list_price"), "last_price": p.get("last_price"),
+                            "ended": p["end"].isoformat() if p.get("end") else None, "end_event": p.get("end_event"),
+                            "last_change": p["changes"][-1]["date"].isoformat() if p.get("changes") else None}
+                           for p in sorted(later, key=lambda p: p["start"])],
         # the CURRENT listing's own asking-price moves (see current_price_changes)
         "current_price_changes": current_price_changes(current),
         "prior_sales":[{"date": s["date"].isoformat(), "price": s.get("price")} for s in prior_sales],
@@ -1615,6 +1623,22 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None, l
         else:
             bits.append(f"This home last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has "
                         "changed since then should be confirmed with the seller.")
+    # A home not for sale now that was listed again after that sale and came off the market unsold (11/20 outside
+    # grader, 101 Watkins Pond Blvd #4-103): the client is told, once, in plain words.
+    unsold = [p for p in (s.get("later_listings") or []) if isinstance(p, dict) and p.get("end_event") == "off_market"]
+    if not listed and unsold:
+        p = unsold[-1]
+        price = _money(p.get("last_price")) or _money(p.get("list_price"))
+        start = _d(p.get("listed"))
+        seen = _d(p.get("ended")) or _d(p.get("last_change")) or start
+        if price and start and seen and ((today or date.today()) - seen).days <= 730 \
+                and not (f"${price:,.0f}" in methodology and re.search(r"without (?:a recorded )?sel|did not sell|unsold", methodology, re.I)):
+            orig = _money(p.get("list_price"))
+            ended = _d(p.get("ended"))
+            bits.append(f"It was listed for sale again on {_nice_date(start.isoformat())}"
+                        + (f" at ${orig:,.0f} and reduced to ${price:,.0f}" if orig and orig > price * 1.005 else f", last asking ${price:,.0f},")
+                        + (f" and came off the market on {_nice_date(ended.isoformat())}" if ended else " and came off the market")
+                        + " without selling.")
     # its own paragraph, naming "this home": added after the homes-under-contract paragraph, "It last sold..." read as
     # that other home's sale (11/20 audit, all four seller tests)
     return (methodology.rstrip() + "\n\n" + " ".join(bits)) if bits else methodology

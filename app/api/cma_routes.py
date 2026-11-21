@@ -69,8 +69,26 @@ async def search_cma_comparables(
         results = await service.search_comparables(db, payload)
     # For a listed home the Match % of each sale includes its price level (cma_comp_pick.apply_price_level)
     from app.services import cma_comp_pick
-    _subj = payload.subject.model_dump() if payload.subject else {}
+    _subj = await _subject_with_status(db, payload)
     return cma_comp_pick.apply_price_level(_subj, results, asking_price=cma_comp_pick.asking_price_now(_subj), subject_sqft=payload.subject_sqft)
+
+
+async def _subject_with_status(db: AsyncSession, payload: CmaCompSearchRequest) -> dict:
+    """The search's subject, with the home's MLS status from its own record when the request didn't send one (11/20:
+    the Comps step sent the old list price of a sold / off-market home but not its status, so asking_price_now took
+    that old price as an asking price and every comp's Match % was scored against it)."""
+    subj = payload.subject.model_dump() if payload.subject else {}
+    if any(subj.get(k) for k in ("mls_status", "home_status", "status")) or not payload.listing_key:
+        return subj
+    try:
+        from sqlalchemy import select as _select
+        from app.models.database import Property
+        st = (await db.execute(_select(Property.home_status).where(Property.listing_key == payload.listing_key))).scalar_one_or_none()
+        if st:
+            subj["home_status"] = str(st)
+    except Exception:  # noqa: BLE001 - a missing status only means the plain scores
+        logger.warning("comp search: subject status lookup failed", exc_info=True)
+    return subj
 
 
 @router.post("/comparables/auto-search")
@@ -93,7 +111,7 @@ async def auto_search_cma_comparables(
     # For a listed home the Match % of each sale includes its price level (cma_comp_pick.apply_price_level), so
     # the list still runs highest to lowest and the Comps step still picks the highest.
     from app.services import cma_comp_pick
-    _subj = payload.subject.model_dump() if payload.subject else {}
+    _subj = await _subject_with_status(db, payload)
     results = cma_comp_pick.apply_price_level(_subj, out["results"], asking_price=cma_comp_pick.asking_price_now(_subj),
                                               subject_sqft=payload.subject_sqft)
     return {**out, "results": [c.model_dump() for c in results]}

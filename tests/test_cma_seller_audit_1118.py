@@ -55,9 +55,9 @@ def test_a_seller_report_gets_no_second_price_from_a_home_under_contract():
     assert "$694,000" in buyer                                    # buyer report: unchanged
     assert "$694,000" not in seller and "12%" not in seller and "implies" not in seller
     assert "30 Meadowbrook Ln" in seller and "$624,000 asking price" in seller
-    assert "points above the supported range" in seller and "caution on the high side" in seller
+    assert "could be worth a little more than this report's range" in seller and "adjusted to this home" not in seller   # 11/21
     inside, _ = ai._v10_pending_context_sentence("Value notes.", final=final, trace=_pending_trace(640000), seller=True)
-    assert "falls inside the supported range and backs it" in inside and "$640,000" not in inside
+    assert "it fits this report's range" in inside and "$640,000" not in inside
 
 
 # ---- the seller questions + placement band (11/18) --------------------------------------------------------------

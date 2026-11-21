@@ -87,8 +87,8 @@ def test_omissions_misquotes_and_an_agents_own_note_go_to_the_agent():
     ]
     pricing, comps, applied, for_agent = audit.apply_findings(r.pricing, r.comparables, findings, p)
     assert not applied and len(for_agent) == 3 and comps[0]["commentary"].startswith("My own words")
-    msg = audit.agent_message(for_agent)
-    assert msg.startswith("Review before sending: the final read of this report noted") and "2025 sale" in msg
+    # 11/21: the final read's own remarks stay in its record, off the agent's screen
+    assert audit.agent_message(for_agent) is None
 
 
 def test_only_so_many_silent_edits(monkeypatch):
@@ -145,7 +145,7 @@ def test_a_run_edits_the_text_bills_once_and_keeps_the_value(monkeypatch):
     est = r.pricing["ai_estimate"]
     assert est["value"] == 667000 and est["range_min"] == 615000 and r.pricing["recommended_list_price"] == 665000
     assert "both of which sold above list" not in r.pricing["listing_strategy_notes"]
-    assert est["audit_review"]["message"].startswith("Review before sending") and len(est["final_audit"]["applied"]) == 1
+    assert est["audit_review"] is None and len(est["final_audit"]["applied"]) == 1   # its remarks stay off the agent screen (11/21)
     assert any(f.startswith("Final read: removed a sentence in strategy") for f in est["qa_flags"]) and "earlier flag" in est["qa_flags"]
     assert calls["model"] == 1 and calls["usage"] == [("cma_audit", 9000, 400, 0.12)] and calls["spend"][0][1] == 0.12
     assert out["cost_usd"] == 0.12 and out["reused"] is False
@@ -319,8 +319,7 @@ def test_details_it_could_not_find_are_listed_for_the_agent_to_check():
     assert msg.startswith("Review before sending: these details are in neither the listing text nor the MLS record")
     assert "check each against the photos" in msg and "carport roof covering" in msg and "quartz counters" in msg
     both = audit.agent_message([{"why": "Comp 3 carries a 24.7% share.", "sentence": "It carries little weight."}], unverified)
-    assert 'the final read of this report noted - (1) "It carries little weight." - Comp 3 carries a 24.7% share.' in both \
-        and "These details are in neither" in both
+    assert "the final read of this report noted" not in both and "these details are in neither" in both   # 11/21
     assert audit.agent_message([], []) is None and audit.agent_message([]) is None
     many = audit.agent_message([], [dict(unverified[0], sentence=f"Sentence {i}.") for i in range(6)])
     assert "(+3 more)" in many and "Sentence 2." in many and "Sentence 3." not in many

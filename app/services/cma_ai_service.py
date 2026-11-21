@@ -3187,7 +3187,7 @@ async def _attach_listing_history(db: AsyncSession, subject: dict, listing_key: 
     # home that is for sale now - a closed or off-market record has no "current listing" to describe.
     pc = summary.get("current_price_changes") if (tl.get("is_active") or tl.get("is_under_contract")) else None
     summary["current_price_changes"] = pc
-    if not summary["lines"] and not pc:
+    if not summary["lines"] and not pc and not summary.get("later_listings"):
         return subject
     out = dict(subject)
     out["_listing_history"] = summary
@@ -3531,7 +3531,7 @@ def _seller_not_listed(mode: str, subject: dict, timeline: dict) -> tuple[dict, 
             _hist["lines"] = [*(_hist.get("lines") or []), f"Sold {_day} for ${last_price:,.0f}"]
             _hist["last_sale_is_this_listing"] = True
             subj["_listing_history"] = _hist
-    last_listing = _unsold_last_listing(subj, tl)
+    last_listing = _unsold_last_listing(subj, tl) or _later_unsold_listing(subj)
     if last_listing:
         lines.append(last_listing["line"] + " Buyers did not pay that price: treat it as a ceiling on what the home is worth "
                      "today, never as an asking price or a starting point, and say so plainly when recommending a list price.")
@@ -3600,6 +3600,37 @@ def _unsold_last_listing(subject: dict, tl: dict) -> Optional[dict]:
     return {"price": round(price), "original_price": round(orig) if orig else None,
             "list_date": list_date.isoformat() if list_date else None, "ended": ended.isoformat() if ended else None,
             "days": int(round(days)) if days else None, "line": line}
+
+
+def _later_unsold_listing(subject: dict) -> Optional[dict]:
+    """The same fact when the record the report is about is an older SALE and the home was listed again after it
+    without selling (11/20 outside grader, 101 Watkins Pond Blvd #4-103: sold Mar 2025, listed again May 28, 2026,
+    cut to $410,000, off the market Nov 2 - the report recommended $425,000 and never mentioned it). From the home's
+    own history (cma_fact_check.summarize_history 'later_listings'). Same shape as _unsold_last_listing."""
+    later = [p for p in ((subject or {}).get("_listing_history") or {}).get("later_listings") or []
+             if isinstance(p, dict) and p.get("end_event") == "off_market"]   # ended unsold - never one still for sale
+    if not later:
+        return None
+    p = later[-1]
+    price = _as_float(p.get("last_price")) or _as_float(p.get("list_price"))
+    if not price:
+        return None
+    list_date, ended = _parse_iso_date(p.get("listed")), _parse_iso_date(p.get("ended"))
+    last_seen = ended or _parse_iso_date(p.get("last_change")) or list_date
+    if not last_seen or (_tmach.today() - last_seen).days > _UNSOLD_LISTING_MAX_AGE_DAYS:
+        return None
+    days = float((ended - list_date).days) if (ended and list_date and ended >= list_date) else None
+    orig = _as_float(p.get("list_price"))
+    orig = orig if orig and orig > price * 1.005 else None
+    line = "Its last MLS listing"
+    if list_date:
+        line += f", listed {_fact_check._nice_date(list_date.isoformat())}"
+    line += f", asked ${price:,.0f}" + (f" (reduced from ${orig:,.0f})" if orig else "")
+    line += " and ended" + (f" {_fact_check._nice_date(ended.isoformat())}" if ended else "")
+    line += (f", about {int(round(days))} days after it was listed," if days and days >= 1 else "") + " without a recorded sale."
+    return {"price": round(price), "original_price": round(orig) if orig else None,
+            "list_date": list_date.isoformat() if list_date else None, "ended": ended.isoformat() if ended else None,
+            "days": int(round(days)) if days else None, "line": line, "after_last_sale": True}
 
 
 def _buyer_off_market(subject: dict, tl: dict, status: str) -> tuple[dict, dict]:
@@ -11400,9 +11431,14 @@ _COMPETITION_CONDITION_RE = re.compile(
     r"\b(renovat\w*|remodel\w*|updated?|upgrad\w*|dated|outdated|condition|finish(?:es|ed)?|well[- ]maintained|well[- ]kept|"
     r"move[- ]in[- ]ready|turn[- ]?key|pristine|fixer\w*|immaculate|modern(?:i[sz]ed)?|charming|stunning|beautiful)\b", re.I)
 _COMPETITION_SOLD_RE = re.compile(r"\b(sold|closed|went)\s+(?:for|at)\s+\$|\bcontract price (?:of|was|is)\s+\$", re.I)
+# 11/20: "3,147 square feet" and "1,161 square feet" read as house numbers on a "Square", and "after 4 days. 111 Tyson
+# Rd" ran across the full stop - so the paragraph was dropped on 10 of the last 12 reports. A number inside a thousands
+# figure or followed by a measure is not an address, and an address never spans a full stop.
 _COMPETITION_ADDRESS_RE = re.compile(
-    r"\b(\d{1,6})(?:-\d+)?\s+(?:[A-Za-z0-9.'-]+\s+){0,4}(?:rd|road|ln|lane|ave|avenue|st|street|dr|drive|ct|court|cir|circle|"
-    r"blvd|boulevard|pike|way|pl|place|ter|terrace|hwy|highway|trl|trail|sq|square|row|run|walk)\b", re.I)
+    r"(?<![\d,.$])\b(\d{1,6})(?:-\d+)?(?!\s*(?:sq\b|sq\.|sqft|square\s+f|days?\b|miles?\b|beds?\b|bedrooms?\b|baths?\b|"
+    r"bathrooms?\b|acres?\b|years?\b|percent\b|%))\s+(?:[A-Za-z0-9'-]+\s+){0,4}(?:rd|road|ln|lane|ave|avenue|st|street|dr|"
+    r"drive|ct|court|cir|circle|blvd|boulevard|pike|way|pl|place|ter|terrace|hwy|highway|trl|trail|sq|square|row|run|walk)\b",
+    re.I)
 _COMPETITION_NOTE_SYSTEM = (
     "You write ONE short paragraph (3 to 5 sentences, under 110 words) for a client-facing real-estate CMA report. It "
     "sits under the cards of similar homes that are for sale now and similar homes that are under contract now, and "
@@ -11474,17 +11510,22 @@ def _competition_note_checked(text: str, facts: dict) -> Optional[str]:
     subj = facts.get("subject") or {}
     money = [d for d in (_as_float(re.sub(r"[^\d.]", "", str(v))) for row in [subj, *homes]
                          for k, v in row.items() if "price" in k and "$" in str(v)) if d]
-    for m in re.finditer(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kKmM]\b)?", text):
-        fig = _as_float(m.group(1).replace(",", ""))
-        if fig is None:
-            return None
-        fig *= {"k": 1_000, "m": 1_000_000}.get((m.group(2) or "").lower(), 1)
-        if not any(abs(fig - known) <= max(1.0, 0.005 * known) for known in money):
-            return None                       # a figure that is on no card: the paragraph is not shown
     numbers = {re.match(r"\d+", str(r.get("address") or "")).group(0) for r in [subj, *homes] if re.match(r"\d+", str(r.get("address") or ""))}
-    if any(m.group(1) not in numbers for m in _COMPETITION_ADDRESS_RE.finditer(text)):
-        return None                           # an address that is on no card
-    kept = [s for s in _fact_check.sentences(text) if not _COMPETITION_CONDITION_RE.search(s) and not _COMPETITION_SOLD_RE.search(s)]
+
+    def _sentence_ok(s: str) -> bool:
+        for m in re.finditer(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kKmM]\b)?", s):
+            fig = _as_float(m.group(1).replace(",", ""))
+            if fig is None:
+                return False
+            fig *= {"k": 1_000, "m": 1_000_000}.get((m.group(2) or "").lower(), 1)
+            if not any(abs(fig - known) <= max(1.0, 0.005 * known) for known in money):
+                return False                  # a figure that is on no card
+        return not any(m.group(1) not in numbers for m in _COMPETITION_ADDRESS_RE.finditer(s))   # an address on no card
+
+    # A sentence with a figure or an address that is on no card is cut - not the whole paragraph (11/20: 10 of the last
+    # 12 reports showed an empty "What the competition tells us" because one such sentence dropped all of it).
+    kept = [s for s in _fact_check.sentences(text) if _sentence_ok(s)
+            and not _COMPETITION_CONDITION_RE.search(s) and not _COMPETITION_SOLD_RE.search(s)]
     out = " ".join(kept).strip()
     out, _ = _fact_check.fix_dates_and_spelling(out)
     return out if 60 <= len(out) <= 1200 and len(kept) >= 2 else None
@@ -11706,6 +11747,22 @@ def _pending_competition_review(subject: dict, homes: list, value, low, high, tr
         iv = _pending_implied_value(subject, h, market_psf)
         if iv:
             strong.append((h, iv))
+    # Homes FOR SALE that match well, measured the same way - never to move the value (actives never count), only so
+    # the seller's report can say how its closest competitor compares (11/20 outside grader: Goodwick's 99% match
+    # asked $435,000 against a $450,000 recommendation, Rockville's 84% match $415,000 against $425,000 - unexplained).
+    _actives = []
+    for h in homes:
+        if h.get("status") == "pending" or (h.get("match_score") or 0) < _PENDING_STRONG_MATCH or h.get("new_construction"):
+            continue
+        if _pending_land_mismatch(subject, h) or _fee_mismatch(_s_fee, _monthly_fee_total(h)):
+            continue
+        _iv = _pending_implied_value(subject, h, market_psf)
+        if _iv:
+            _actives.append({"listing_key": h.get("listing_key"), "street_address": h.get("street_address"),
+                             "list_price": h.get("list_price"), "implied_value": round(_iv / 1000) * 1000,
+                             "match_score": h.get("match_score"), "distance_miles": h.get("distance_miles"),
+                             "days_on_market": h.get("days_on_market"), "sqft": h.get("sqft")})
+    info["actives_compared"] = _actives
     info["pendings_used"] = [{"listing_key": h.get("listing_key"), "street_address": h.get("street_address"),
                               "adjustments": _pending_adjustment_parts(subject, h, market_psf, iv),
                               "list_price": h.get("list_price"), "implied_value": round(iv / 1000) * 1000,
@@ -11935,9 +11992,8 @@ def _evidence_strength(subject: Optional[dict], trace: Optional[dict], value, co
         # this report's method any more. The label itself stays - the answered test is only 5 past sales.
         if ((trace or {}).get("placement_check") or {}).get("how") == "comp_marks" and level == "fair":
             record = ("There is no asking price to check the sales against, so the value was placed among the sales from "
-                      "the comp-by-comp answers (nicer, about the same, not as nice). On a small test of 5 past sales "
-                      "placed this way the average miss was about 4-5%, against about 11% from the sales and the "
-                      "adjustment table alone - make sure the answers fit the home as it is today, and lean on the range.")
+                      "the comp-by-comp answers (nicer, about the same, not as nice) - make sure the answers fit the home "
+                      "as it is today, and lean on the range.")   # (test statistics off the agent's screen, owner 11/21)
     label = {"strong": "Strong evidence", "fair": "Fair evidence", "limited": "Limited evidence"}[level]
     why = ("; ".join(signs[:4])[:1].upper() + "; ".join(signs[:4])[1:] + ".") if signs else None
     return {"level": level, "label": label, "signs": signs, "listed": listed, "multi_family": multi,
@@ -16845,6 +16901,8 @@ def _v10_reconcile_anchor_direction_prose(methodology: str, *, final: Optional[d
     text, gap_flags = _v10_asking_gap_sentence(text, final=final, trace=trace)
     text, oa_flags = _v10_over_ask_pattern_sentence(text, trace=trace)
     text, pc_flags = _v10_pending_context_sentence(text, final=final, trace=trace, seller=seller)
+    text, ac_flags = _v10_active_context_sentence(text, final=final, trace=trace, seller=seller)
+    pc_flags = pc_flags + ac_flags
     text, au_flags = _v10_auction_sentence(text, trace=trace)
     text, _pl_flags = _v10_placement_sentence(text, trace=trace)
     au_flags = au_flags + _pl_flags
@@ -16977,19 +17035,58 @@ def _v10_pending_context_sentence(methodology: str, *, final: Optional[dict], tr
         # implies about $694,000, about 12% above this report's value" under a $620,000 recommended list price - the
         # owner took the sales-to-value page out for the same reason, 11/16: "everyone will argue it"). Same facts,
         # same direction, no dollar figure and no percentage for this home.
+        # 11/21 (owner): facts, and in plain words whether it says this home is worth more or less - never the
+        # adjustment steps ("adjusted to this home... treat it as a caution on the high side...").
         _side = 'below' if (lo and iv < lo) or (not lo and gap < 0) else 'above'
         s = (f" Homes under contract ({_PENDING_CONTEXT_MARK}): {_title_address(p.get('street_address'))}"
              + (f", {dist:.2f} miles away," if dist is not None else "")
              + " went under contract" + (f" after {round(dom)} days" if dom is not None else "")
-             + f" at a ${lp:,.0f} asking price. Its contract price isn't public until it closes, so it could not be used "
-             "as a comparable sale and does not change the value"
-             + (f" - with other close matches it moved the value {'up' if nudge > 0 else 'down'} {abs(nudge):g}% (the most "
-                "pending homes may move it is 2.5%)."
+             + f" at a ${lp:,.0f} asking price; what it sells for isn't public yet. "
+             + (f"Together with other homes under contract nearby, it nudged the value {'up' if nudge > 0 else 'down'} a little."
                 if nudge and p.get("moved_value", True) and (gap > 0) == (nudge > 0) else
-                (" - adjusted to this home for its differences, it falls inside the supported range and backs it." if inside else
-                 f" - adjusted to this home for its differences, it points {_side} the supported range, so treat it as a "
-                 f"caution on the {'low' if _side == 'below' else 'high'} side and check its sale price when it closes.")))
+                ("Allowing for its differences, it fits this report's range." if inside else
+                 f"Allowing for its differences, it suggests this home could be worth a little "
+                 f"{'less' if _side == 'below' else 'more'} than this report's range - worth checking its sale price when it closes.")))
     return methodology.rstrip() + s, ["Methodology summary: said how the strongest nearby home under contract was weighed."]
+
+
+_ACTIVE_CONTEXT_MARK = "Homes for sale now (asking prices, not sales)"
+_ACTIVE_CONTEXT_MATCH = 80        # the closest competitor named only when it is this good a match
+_ACTIVE_CONTEXT_MILES = 1.0
+
+
+def _v10_active_context_sentence(methodology: str, *, final: Optional[dict], trace: Optional[dict],
+                                 seller: bool = False) -> tuple[str, list[str]]:
+    """Seller reports: the closest home for sale now and how it compares with this value, in words (11/20 outside
+    grader: the recommended price sat above a 99% match's asking price and the report never said why). Like the
+    seller line on a home under contract - no second dollar figure for this home, only where it lands."""
+    if not seller or not methodology or _ACTIVE_CONTEXT_MARK in methodology:
+        return methodology, []
+    v = _as_float((final or {}).get("value"))
+    rows = [a for a in (((trace or {}).get("pending_competition") or {}).get("actives_compared") or [])
+            if _as_float(a.get("implied_value")) and _as_float(a.get("list_price"))
+            and (a.get("match_score") or 0) >= _ACTIVE_CONTEXT_MATCH
+            and (_as_float(a.get("distance_miles")) or 0) <= _ACTIVE_CONTEXT_MILES]
+    if not v or not rows:
+        return methodology, []
+    a = max(rows, key=lambda x: ((x.get("match_score") or 0), -(_as_float(x.get("distance_miles")) or 99)))
+    iv, lp = _as_float(a["implied_value"]), _as_float(a["list_price"])
+    gap = (iv - v) / v * 100
+    dist, dom = _as_float(a.get("distance_miles")), _as_float(a.get("days_on_market"))
+    s = (f"\n\n{_ACTIVE_CONTEXT_MARK}: the closest match, {_title_address(a.get('street_address'))}"
+         + (f", {dist:.2f} miles away," if dist is not None else "")
+         + f" is asking ${lp:,.0f}" + (f" after {round(dom)} days on the market" if dom is not None else "") + ". ")
+    # facts and a plain direction only - an asking price is not a sale, and it never caps or moves the value (owner 11/21)
+    if abs(gap) < 2:
+        s += ("Allowing for its differences, it is priced about the same as this home is worth, so buyers will weigh the "
+              "two on condition and presentation.")
+    elif gap < 0:
+        s += ("Allowing for its differences, it is priced a little below this home's value, and buyers will compare the two "
+              "side by side - so make this home's advantages easy to see.")
+    else:
+        s += ("Allowing for its differences, it is priced a little above this home's value, which leaves this home well "
+              "placed against it.")
+    return methodology.rstrip() + s, ["Methodology summary: said how the closest home for sale compares with the value."]
 
 
 def _title_address(addr) -> str:

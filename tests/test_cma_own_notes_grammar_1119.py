@@ -127,7 +127,7 @@ def test_final_read_note_is_numbered_and_drops_self_cancelling_remarks():
     assert not audit._WEAK_NOTE_RE.search("Comp 3 sold in 2025, not 2024")
     msg = audit.agent_message([{"why": "comp 3 sold in 2025, not 2024.", "sentence": "It sold last year."},
                                {"why": "the lot is 1.6 acres", "sentence": "It sits on 2 acres."}])
-    assert '(1) "It sold last year." - Comp 3 sold in 2025, not 2024. (2) "It sits on 2 acres." - The lot is 1.6 acres.' in msg
+    assert msg is None   # 11/21: the final read's own remarks stay off the agent's screen
 
 
 def test_update_preview_says_where_the_value_would_go():

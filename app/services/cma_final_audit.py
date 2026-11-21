@@ -433,6 +433,10 @@ def agent_message(for_agent: list, unverified: Optional[list] = None) -> Optiona
     record. Two outside audits (rounds 5 and 6) called it the most important open point that such a sentence stayed
     in the client's report with nobody told. They are never removed (the detail may come from the listing photos,
     which this reader cannot see) - the agent, who can look at the photos, is told which ones to check."""
+    # 11/21 (owner): the agent's screen keeps to what they can act on. The final read's own remarks on the wording ("a
+    # broad market claim", "claims what buyers will do") stay in final_audit for us - only details to check against the
+    # photos are put to the agent.
+    for_agent = []
     if not for_agent and not unverified:
         return None
     parts = []

@@ -1024,9 +1024,13 @@ def test_the_competition_facts_are_the_cards_and_nothing_else():
 def test_a_competition_paragraph_is_shown_only_when_every_price_and_address_is_on_a_card():
     f = ai._competition_facts(_CSUBJ, _CHOMES, "buyer", {"active_market_days": 7})
     assert ai._competition_note_checked(_CGOOD, f) == _CGOOD
-    assert ai._competition_note_checked(_CGOOD.replace("$395,000", "$359,000"), f) is None        # a price on no card
-    assert ai._competition_note_checked(_CGOOD.replace("9 Darwin Dr", "12 Hillcroft Rd"), f) is None   # an address on no card
-    assert ai._competition_note_checked(_CGOOD + " This home is worth about $383,000.", f) is None    # a value: not its job
+    # 11/20: a sentence with a price or an address on no card is cut - no longer the whole paragraph (it had left
+    # "What the competition tells us" empty on 10 of 12 live reports). The invented figure still never shows.
+    out = ai._competition_note_checked(_CGOOD.replace("$395,000", "$359,000"), f)                 # a price on no card
+    assert out is None or "$359,000" not in out
+    out = ai._competition_note_checked(_CGOOD.replace("9 Darwin Dr", "12 Hillcroft Rd"), f)        # an address on no card
+    assert out is None or "12 Hillcroft Rd" not in out
+    assert ai._competition_note_checked(_CGOOD + " This home is worth about $383,000.", f) == _CGOOD  # a value: not its job
     assert ai._competition_note_checked("- Two homes.", f) is None and ai._competition_note_checked("", f) is None
     # nobody looked at photos: a sentence about condition is cut, the rest stays
     cut = ai._competition_note_checked(_CGOOD + " 9 Darwin Dr has a renovated kitchen and updated baths.", f)
