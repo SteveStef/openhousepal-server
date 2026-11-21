@@ -173,6 +173,25 @@ async def update_user_plan(
         )
 
 
+@router.post("/users/{user_id}/reset-ai-usage")
+async def reset_ai_usage(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: UserModel = Depends(require_admin_user),
+):
+    """Start this agent's AI usage bar over at 0% (owner, 11/20: a demo account had used its month). Spend before
+    now stops counting toward their allowance for the rest of this period; the period still ends on the usual day.
+    Nothing is deleted - every usage record and the money it cost stay as they were - and billing is untouched."""
+    from datetime import datetime, timezone
+    user = await db.get(UserModel, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    user.ai_usage_reset_at = datetime.now(timezone.utc)
+    await db.commit()
+    logger.info("Admin reset an agent's AI usage", extra={"admin": admin.id, "user_id": user.id})
+    return {"success": True, "user_id": user.id, "ai_usage_reset_at": user.ai_usage_reset_at.isoformat()}
+
+
 @router.patch("/users/{user_id}/test-copy")
 async def set_test_copy(
     user_id: str,

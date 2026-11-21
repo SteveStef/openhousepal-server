@@ -544,12 +544,12 @@ def test_the_homes_earlier_sale_is_stated_once():
     hist = {"last_sale": {"date": "2024-06-07", "price": 331700}}
     today = datetime.date(2026, 3, 31)
     once = fc.history_sentence("The value is $300,000.", hist, today=today)
-    assert once.count("$331,700") == 1 and "It last sold on Jun 7, 2024 for $331,700" in once
+    assert once.count("$331,700") == 1 and "This home last sold on Jun 7, 2024 for $331,700" in once
     assert fc.history_sentence(once, hist, today=today) == once                                   # a second pass adds nothing
     written = "The value is $300,000. The home last sold on Jun 7, 2024 for $331,700; what has changed since then should be confirmed with the seller."
     assert fc.history_sentence(written, hist, today=today) == written                             # the writer already said it
     other = "The value is $300,000. A neighbour's home sold for $331,700."                         # same figure, not this home's sale
-    assert "It last sold on Jun 7, 2024" in fc.history_sentence(other, hist, today=today)
+    assert "This home last sold on Jun 7, 2024" in fc.history_sentence(other, hist, today=today)
 
 
 def test_cutting_an_engine_clause_never_leaves_a_lead_in_with_nothing_after_it():

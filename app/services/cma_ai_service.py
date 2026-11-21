@@ -5107,40 +5107,89 @@ def _reconcile_directional_claims(
     for chunk, _start, _end in _sentence_chunks(text):
         chunk_lower = chunk.lower()
         matched_keys = [k for k in by_key if _chunk_mentions_comp(chunk_lower, k, comp_num_by_key, addr_by_key)]
-        if len(matched_keys) != 1:
+        if not matched_keys:
             out_parts.append(chunk)
             continue
-        key = matched_keys[0]
-        comp = by_key[key]
-        label = f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp")
-        new_chunk = chunk
-        for field, (noun_re, noun_label) in _FIELD_NOUN_RE.items():
-            if not noun_re.search(new_chunk):
+        if len(matched_keys) > 1:
+            # one sentence naming several sales ("63 Joseph Wick Dr, with more bedrooms and a smaller lot, marks the upper
+            # limit, while 93 Lilac Way ... marks the lower" - 11/20, the lot was larger): each part, from one sale's name
+            # to the next, is checked against that sale. A sale named twice in it is left alone.
+            starts = sorted((_comp_mention_start(chunk_lower, k, comp_num_by_key, addr_by_key), k) for k in matched_keys)
+            if any(s < 0 for s, _k in starts) or len({s for s, _k in starts}) != len(starts):
+                out_parts.append(chunk)
                 continue
-            words = _DIRECTION_WORDS[field]
-            bigger_hits = [w for w in words["bigger"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
-            smaller_hits = [w for w in words["smaller"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
-            if bigger_hits and smaller_hits:
-                blocking.append(f"{label} {noun_label} direction is self-contradictory in the same sentence - review.")
-                continue
-            if not bigger_hits and not smaller_hits:
-                continue
-            claimed = "bigger" if bigger_hits else "smaller"
-            actual = _actual_direction(subject.get(field), comp.get(field))
-            if actual is None or actual == claimed:
-                continue
-            hit_word = (bigger_hits or smaller_hits)[0]
-            opposite = _DIRECTION_OPPOSITE.get(hit_word.lower())
-            if not opposite:
-                continue
-
-            def _sub(m: re.Match, _opp=opposite) -> str:
-                return _match_case(_opp, m.group(0))
-
-            new_chunk = re.sub(rf"\b{re.escape(hit_word)}\b", _sub, new_chunk, count=1, flags=re.IGNORECASE)
-            flags.append(f"{field_label}: {label} {noun_label} said \"{hit_word}\" but the data says {actual} - corrected to \"{opposite}\".")
-        out_parts.append(new_chunk)
+            pieces = [chunk[:starts[0][0]]]
+            for i, (s, k) in enumerate(starts):
+                e = starts[i + 1][0] if i + 1 < len(starts) else len(chunk)
+                seg, f, b = _directional_claims_one(chunk[s:e], field_label, subject, by_key[k], k, comp_num_by_key, addr_by_key)
+                pieces.append(seg)
+                flags.extend(f)
+                blocking.extend(b)
+            out_parts.append("".join(pieces))
+            continue
+        seg, f, b = _directional_claims_one(chunk, field_label, subject, by_key[matched_keys[0]], matched_keys[0],
+                                            comp_num_by_key, addr_by_key)
+        out_parts.append(seg)
+        flags.extend(f)
+        blocking.extend(b)
     return "".join(out_parts), flags, blocking
+
+
+def _comp_mention_start(chunk_lower: str, key: str, comp_num_by_key: dict, addr_by_key: dict) -> int:
+    """Where a sale is first named in the text (-1 = not named)."""
+    num = comp_num_by_key.get(key)
+    addr = (addr_by_key.get(key) or "").lower()
+    tokens = [t for t in ([f"comp #{num}", f"comp {num}"] if num else []) + ([addr] if len(addr) >= 5 else []) if t]
+    found = [chunk_lower.find(t) for t in tokens if t in chunk_lower]
+    return min(found) if found else -1
+
+
+# "Has a pool" said of a sale whose record shows only a community pool (11/20, 22 Saint Anthony Ct: "Yes - Community";
+# the write-up said it "has a pool and other amenities" while its card said "a community pool membership option").
+_POOL_CLAIM_RE = re.compile(r"\b(a|an)\s+(?:private\s+|in-?ground\s+|swimming\s+|heated\s+)?pool\b(?!\s*(?:membership|access|table|club|nearby))",
+                            re.IGNORECASE)
+
+
+def _community_pool_only(comp: dict) -> bool:
+    p = _style_text(comp.get("pool"))
+    return bool(p) and "community" in p and not re.search(r"personal|private|in[- ]?ground|above[- ]?ground|heated", p)
+
+
+def _directional_claims_one(chunk: str, field_label: str, subject: dict, comp: dict, key, comp_num_by_key: dict,
+                            addr_by_key: dict) -> tuple[str, list[str], list[str]]:
+    flags: list[str] = []
+    blocking: list[str] = []
+    label = f"Comp #{comp_num_by_key.get(key)}" if comp_num_by_key.get(key) else (addr_by_key.get(key) or "a comp")
+    new_chunk = chunk
+    if _community_pool_only(comp) and _POOL_CLAIM_RE.search(new_chunk) and "community" not in new_chunk.lower():
+        new_chunk = _POOL_CLAIM_RE.sub(lambda m: "access to a community pool", new_chunk, count=1)
+        flags.append(f"{field_label}: {label} was said to have a pool - its record shows a community pool; said so.")
+    for field, (noun_re, noun_label) in _FIELD_NOUN_RE.items():
+        if not noun_re.search(new_chunk):
+            continue
+        words = _DIRECTION_WORDS[field]
+        bigger_hits = [w for w in words["bigger"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
+        smaller_hits = [w for w in words["smaller"] if re.search(rf"\b{re.escape(w)}\b", new_chunk, re.IGNORECASE)]
+        if bigger_hits and smaller_hits:
+            blocking.append(f"{label} {noun_label} direction is self-contradictory in the same sentence - review.")
+            continue
+        if not bigger_hits and not smaller_hits:
+            continue
+        claimed = "bigger" if bigger_hits else "smaller"
+        actual = _actual_direction(subject.get(field), comp.get(field))
+        if actual is None or actual == claimed:
+            continue
+        hit_word = (bigger_hits or smaller_hits)[0]
+        opposite = _DIRECTION_OPPOSITE.get(hit_word.lower())
+        if not opposite:
+            continue
+
+        def _sub(m: re.Match, _opp=opposite) -> str:
+            return _match_case(_opp, m.group(0))
+
+        new_chunk = re.sub(rf"\b{re.escape(hit_word)}\b", _sub, new_chunk, count=1, flags=re.IGNORECASE)
+        flags.append(f"{field_label}: {label} {noun_label} said \"{hit_word}\" but the data says {actual} - corrected to \"{opposite}\".")
+    return new_chunk, flags, blocking
 
 
 # A value-driver note calling out busy/connector-road exposure for a comp the map data actually
@@ -6951,7 +7000,13 @@ def _private_utilities(d: Optional[dict]) -> Optional[bool]:
     w, sw = _style_text((d or {}).get("water_source")), _style_text((d or {}).get("sewer"))
     if not w and not sw:
         return None
-    return bool(re.search(r"\bwell\b", w) or re.search(r"septic|cess", sw))
+    if re.search(r"\bwell\b", w) or "cess" in sw:
+        return True
+    if sw and _sewer_kind(d) is None:
+        # mixed words ("Public Septic, Public Sewer" - 901 N Penn St #F810, 11/20): not known either way. It had
+        # counted as a private system, so the same floor plan one floor down lost its utilities points in the search.
+        return None
+    return _sewer_kind(d) == "septic"
 
 
 _V10_BG_FIELD_WINS = os.getenv("CMA_BG_FIELD_WINS", "0") == "1"
@@ -8366,6 +8421,11 @@ def _relevance_market_area_score(subject: dict, comp: dict, *, urban: bool = Fal
             # difference inside one township: 223 Upper Gulph Rd went from a 4.8% miss to 31.5%.)
             if same is False:
                 return 0.0, detail
+        if _building_key(subject) and _building_key(subject) == _building_key(comp):
+            # Same building is the same neighborhood, whatever each listing calls it (11/20, 901 N Penn St: one unit
+            # filed under "Waterfront Square", the next floor's under "Northern Liberties" - the twin unit scored 0.4).
+            detail["neighborhood"] = "same building"
+            return 1.0, detail
         pieces = []
         for label, keys, weight in (("neighborhood", ("subdivision_name", "neighborhood", "neighborhood_name"), 0.6),
                                     ("zipcode", ("zipcode", "postal_code"), 0.4)):
@@ -13680,8 +13740,8 @@ def _tidy_caps_address(addr) -> str:
     for w in t.split():
         if re.fullmatch(r"\d+(ST|ND|RD|TH)", w):
             out.append(w.lower())
-        elif re.fullmatch(r"[NSEW]{1,2}", w) or re.fullmatch(r"#?\d+[A-Z]?", w):
-            out.append(w)
+        elif re.fullmatch(r"[NSEW]{1,2}", w) or re.fullmatch(r"#?\d+[A-Z]?", w) or w.startswith("#"):
+            out.append(w)    # a unit stays as written: '#P1103', not '#p1103' (11/20)
         else:
             out.append(w.capitalize())
     return " ".join(out)
@@ -13760,9 +13820,13 @@ _TAX_GAP_MIN_PER_YEAR = 2000  # ...and at least this many dollars a year cheaper
 _TAX_GAP_MARK = "annual property taxes"
 
 
+_TAX_PLACEHOLDER_MAX = 100    # a yearly tax under this is a stand-in on the listing (new builds: "$1"), not a bill
+
+
 def _annual_taxes(d: Optional[dict]) -> Optional[float]:
     v = _as_float(_first_present(d or {}, "annual_taxes", "taxes", "tax_annual_amount"))
-    return v if v and v > 0 else None
+    # 11/20, 6979 Mayfair Ter: two 2025 new builds listed "$1" a year, and their write-ups called it a tax abatement
+    return v if v and v >= _TAX_PLACEHOLDER_MAX else None
 
 
 def _tax_gap_sentence(subject: Optional[dict], comp: Optional[dict], ref_price: Optional[float]) -> Optional[str]:
@@ -16853,6 +16917,11 @@ def _v10_placement_sentence(methodology: str, *, trace: Optional[dict]) -> tuple
     """Say plainly that where the home sits among the sales is the agent's own read (seller placement band, 11/18)."""
     pc = (trace or {}).get("placement_check") or {}
     if not methodology or not pc.get("placement") or _PLACEMENT_BASIS_MARK in methodology:
+        return methodology, []
+    # already said in other words: the language polish rewords the mark ("...today. Sale records can't show this."),
+    # and the sentence was added a second time (11/20, 17 Foxtrail Rd) - the placement words themselves stay verbatim
+    _words = str(pc.get("placement_words") or "").strip()
+    if (_words and _words.lower() in methodology.lower()) or re.search(r"sale records can.?t show", methodology, re.I):
         return methodology, []
     return methodology.rstrip() + " " + _placement_basis_text(pc), [
         "Methodology summary: said that where the home sits among the sales is the agent's own read of it."]
@@ -20039,6 +20108,8 @@ async def _build_content(subject: dict, comps: list[dict], max_photos: int, warn
         comp_for_ai["authoritative_property_features"] = _authoritative_property_features(comp)
         comp_for_ai.update(_fact_check.prompt_facts_comp(subject, comp))
         comp_for_ai["builder_price_note"] = _BUILDER_PRICE_NOTE if _builder_base_price_sale(comp) else None
+        if _as_float(comp_for_ai.get("annual_taxes")) is not None and _annual_taxes(comp_for_ai) is None:
+            comp_for_ai["annual_taxes"] = None    # "$1" etc. is a stand-in on the listing, not a tax bill (11/20)
         add_text(_format_block(f"{_comp_label(i, comp)}:", comp_for_ai, _COMP_FIELDS))
 
     images_sent: dict = {}

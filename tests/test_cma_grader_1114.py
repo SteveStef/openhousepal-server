@@ -232,7 +232,7 @@ def test_seller_report_on_a_home_bought_recently_states_that_sale():
     assert svc._property_record_facts(subj)["history_lines"] == ["Sold 2025-04-24 for $595,000"]
     import datetime
     out = fc.history_sentence("The value is $671,000.", hist, today=datetime.date(2026, 11, 14), listed=False)
-    assert "It last sold on Apr 24, 2025 for $595,000." in out and "updates made since then are not reflected" in out
+    assert "This home last sold on Apr 24, 2025 for $595,000." in out and "updates made since then are not reflected" in out
     assert "confirmed with the seller" not in out
     # an earlier sale found by the history lookup keeps the usual wording
     out = fc.history_sentence("The value is $671,000.", {"last_sale": {"date": "2025-04-24", "price": 595000}},

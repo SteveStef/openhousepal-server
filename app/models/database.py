@@ -114,6 +114,9 @@ class User(Base):
     # Admin-set monthly AI allowance for this one person inside their brokerage group (beats the
     # group's per-agent amount and their plan's). Cleared when they leave the group.
     ai_budget_override_usd = Column(Float, nullable=True)
+    # Admin "Reset AI usage" (owner, 11/20 - demos): AI spend before this moment no longer counts on the agent's
+    # bar or allowance for the rest of the current period. Billing and the usage records themselves are untouched.
+    ai_usage_reset_at = Column(DateTime(timezone=True), nullable=True)
     # The admin-made sign-up code this agent used at checkout (admin "Codes"), if any.
     promo_code_id = Column(String, ForeignKey('promo_codes.id', ondelete='SET NULL'), nullable=True, index=True)
     # The sign-up offer this person claimed (offer_service): their spot is held; checkout shows its prices.

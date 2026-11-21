@@ -171,7 +171,8 @@ def price_points_off(ask_psf: Optional[float], price, sqft) -> float:
         return 0.0
 
 
-_NOT_ON_MARKET = ("closed", "sold", "expired", "withdrawn", "cancel", "off market", "off-market", "off_market", "terminated")
+_NOT_ON_MARKET = ("closed", "sold", "expired", "withdrawn", "cancel", "off market", "off-market", "off_market", "terminated",
+                  "not currently listed", "not listed")   # a seller report's own status for a home not for sale (11/20)
 
 
 def asking_price_now(subject: Optional[dict]) -> Optional[float]:

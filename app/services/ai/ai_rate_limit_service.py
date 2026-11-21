@@ -166,7 +166,14 @@ def billing_period(user: Optional[User], now: Optional[datetime] = None) -> tupl
 
 
 async def usage_period(db: AsyncSession, owner_id: str) -> tuple[datetime, datetime]:
-    return billing_period(await db.get(User, owner_id))
+    """The period the agent's AI allowance counts. An admin "Reset AI usage" inside it starts the count over from
+    that moment; the period still ends (and the next one starts) on the usual day."""
+    user = await db.get(User, owner_id)
+    start, end = billing_period(user)
+    reset = _utc(getattr(user, "ai_usage_reset_at", None))
+    if reset and start < reset <= datetime.now(timezone.utc):
+        start = reset
+    return start, end
 
 
 def resets_text(end: datetime) -> str:

@@ -220,10 +220,10 @@ def above_grade_sqft(row: Optional[dict]) -> Optional[float]:
 
 
 def subject_list_psf(subject: Optional[dict]) -> Optional[float]:
-    try:
-        lp = float((subject or {}).get("list_price") or 0)
-    except (TypeError, ValueError):
-        lp = 0
+    # only while the home is for sale: an old listing's price on a home sold years ago is no "list price" (11/20,
+    # 17 Foxtrail Rd: a comp note compared its rate with "the subject's list price" on an unlisted home)
+    from app.services.cma_comp_pick import asking_price_now
+    lp = asking_price_now(subject) or 0
     ag = above_grade_sqft(subject)
     return (lp / ag) if lp and ag else None
 
@@ -1610,12 +1610,14 @@ def history_sentence(methodology: str, summary: Optional[dict], *, today=None, l
         if s.get("last_sale_is_this_listing"):
             # a seller report on a home bought not long ago: the reader IS the owner, and everything the report
             # knows about the home comes from that sale's listing (701 Great Oak Ln, test round 11/14)
-            bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}. The description and "
-                        "photos used here are from that listing, so updates made since then are not reflected in this value.")
+            bits.append(f"This home last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}. The description "
+                        "and photos used here are from that listing, so updates made since then are not reflected in this value.")
         else:
-            bits.append(f"It last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has changed "
-                        "since then should be confirmed with the seller.")
-    return (methodology.rstrip() + " " + " ".join(bits)) if bits else methodology
+            bits.append(f"This home last sold on {_nice_date(sold.isoformat())} for ${float(ls['price']):,.0f}; what has "
+                        "changed since then should be confirmed with the seller.")
+    # its own paragraph, naming "this home": added after the homes-under-contract paragraph, "It last sold..." read as
+    # that other home's sale (11/20 audit, all four seller tests)
+    return (methodology.rstrip() + "\n\n" + " ".join(bits)) if bits else methodology
 
 
 # ----------------------------------------------------------------------------- high-impact features

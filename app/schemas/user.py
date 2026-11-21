@@ -89,6 +89,7 @@ class User(UserBase):
     idx_domain_migration_agreed_at: Optional[datetime] = None  # null = IDX agent hasn't seen/agreed to the domain-migration prompt yet
     billing_group_id: Optional[str] = None  # paid for by a brokerage group (admin)
     test_copy_of_user_id: Optional[str] = None  # an admin-made test copy of this agent (shares their MLS ID)
+    ai_usage_reset_at: Optional[datetime] = None  # admin "Reset AI usage": spend before this stops counting this period
     last_seen_at: Optional[datetime] = None
     terms_accepted_at: Optional[datetime] = None  # ticked "I agree" at sign-up (null = before this was recorded)
     terms_version: Optional[str] = None
